@@ -30,6 +30,9 @@
 #define _ARM_CRYPTO_MAX_CIPHER_KEY_LENGTH      64
 #define _ARM_CRYPTO_MAX_AUTH_KEY_LENGTH        64
 #define _ARM_CRYPTO_MAX_IV_LENGTH              16
+#define _ARM_CRYPTO_MAX_DATA_LENGTH	       16384
+#define _ARM_CRYPTO_MAX_AAD_LENGTH             16
+#define _ARM_CRYPTO_MAX_DIGEST_LENGTH          64
 
 /*
  * Cipher algorithm capabilities
@@ -39,6 +42,11 @@
 static const odp_crypto_cipher_capability_t cipher_capa_null[] = {
 {.key_len = 0, .iv_len = 0} };
 
+static const odp_crypto_cipher_capability_t cipher_capa_aes_gcm[] = {
+{.key_len = 16, .iv_len = 12},
+{.key_len = 24, .iv_len = 12},
+{.key_len = 32, .iv_len = 12} };
+
 /*
  * Authentication algorithm capabilities
  *
@@ -46,6 +54,9 @@ static const odp_crypto_cipher_capability_t cipher_capa_null[] = {
  */
 static const odp_crypto_auth_capability_t auth_capa_null[] = {
 {.digest_len = 0, .key_len = 0, .aad_len = {.min = 0, .max = 0, .inc = 0} } };
+
+static const odp_crypto_auth_capability_t auth_capa_aes_gcm[] = {
+{.digest_len = 16, .key_len = 0, .aad_len = {.min = 8, .max = 12, .inc = 4} } };
 
 /** Forward declaration of session structure */
 typedef struct odp_crypto_generic_session_t odp_crypto_generic_session_t;
@@ -91,6 +102,12 @@ struct odp_crypto_global_s {
 
 	/* These flags are cleared at alloc_session() */
 	uint8_t ctx_valid[ODP_THREAD_COUNT_MAX][MAX_SESSIONS];
+
+	uint8_t input[_ARM_CRYPTO_MAX_DATA_LENGTH];
+	uint8_t nonce[_ARM_CRYPTO_MAX_IV_LENGTH];
+	uint8_t aad[_ARM_CRYPTO_MAX_AAD_LENGTH];
+	uint8_t digest[_ARM_CRYPTO_MAX_DIGEST_LENGTH];
+	uint8_t output[_ARM_CRYPTO_MAX_DATA_LENGTH + _ARM_CRYPTO_MAX_DIGEST_LENGTH];
 };
 
 static odp_crypto_global_t *global;
@@ -137,6 +154,280 @@ null_crypto_routine(odp_packet_t pkt ODP_UNUSED,
 	return ODP_CRYPTO_ALG_ERR_NONE;
 }
 
+static
+odp_crypto_alg_err_t aes_gcm_encrypt(odp_packet_t pkt,
+				     const odp_crypto_packet_op_param_t *param,
+				     odp_crypto_generic_session_t *session)
+{
+	armv8_cipher_state_t cs = {
+		.counter = {
+			.d = {0, 0}
+		}
+	};
+	armv8_cipher_constants_t cc = {
+		.mode = 0
+	};
+	uint8_t *iv_ptr;
+	uint64_t nonce_length, nonce_byte_length;
+	uint64_t plaintext_length, plaintext_byte_length;
+	uint64_t aad_length, aad_byte_length;
+	int ret = 0;
+
+	/* Clear the allocated buffers */
+	memset(global->input, 0, _ARM_CRYPTO_MAX_DATA_LENGTH);
+	memset(global->nonce, 0, _ARM_CRYPTO_MAX_IV_LENGTH);
+	memset(global->aad, 0, _ARM_CRYPTO_MAX_AAD_LENGTH);
+	memset(global->digest, 0, _ARM_CRYPTO_MAX_DIGEST_LENGTH);
+	memset(global->output, 0, (_ARM_CRYPTO_MAX_DATA_LENGTH +
+	       _ARM_CRYPTO_MAX_DIGEST_LENGTH));
+
+	nonce_length = (session->p.cipher_iv.length) * 8;
+	/* IV length must be a multiple of 16 */
+	nonce_byte_length = ((nonce_length + 127) & ~127UL) >> 3;
+
+	if (param->cipher_iv_ptr)
+		iv_ptr = param->cipher_iv_ptr;
+	else if (session->p.cipher_iv.data)
+		iv_ptr = session->cipher.iv_data;
+	else
+		return ODP_CRYPTO_ALG_ERR_IV_INVALID;
+
+	/* Copy nonce and pad it to nonce_byte_length */
+	for (uint64_t i = 0; i < session->p.cipher_iv.length; i++)
+		global->nonce[i] = iv_ptr[i];
+	for (uint64_t i = session->p.cipher_iv.length; i < nonce_byte_length; i++)
+		global->nonce[i] = 0xde;
+
+	plaintext_length = (param->cipher_range.length) * 8;
+	/* Plaintext length must be a multiple of 16 */
+	plaintext_byte_length = ((plaintext_length + 127) & ~127UL) >> 3;
+
+	/* Copy plaintext and pad it to plaintext_byte_length */
+	uint32_t offset = param->cipher_range.offset;
+	uint32_t seg_len = 0;
+	uint8_t *data = odp_packet_offset(pkt, offset, &seg_len, NULL);
+
+	for (uint64_t i = 0; i < param->cipher_range.length; i++)
+		global->input[i] = data[i];
+	for (uint64_t i = param->cipher_range.length; i < plaintext_byte_length; i++)
+		global->input[i] = 0xde;
+
+	aad_length = (session->p.auth_aad_len) * 8;
+	/* Pad AAD length to multiple of 16 */
+	aad_byte_length = ((aad_length + 127) & ~127UL) >> 3;
+
+	/* Copy AAD and pad it to aad_byte_length */
+	for (uint64_t i = 0; i < session->p.auth_aad_len; i++)
+		global->aad[i] = param->aad_ptr[i];
+	for (uint64_t i = session->p.auth_aad_len; i < aad_byte_length; i++)
+		global->aad[i] = 0xde;
+
+	cs.constants = &cc;
+	switch (session->p.cipher_key.length) {
+	case 16:
+		cs.constants->mode = AES_GCM_128;
+		break;
+	case 24:
+		cs.constants->mode = AES_GCM_192;
+		break;
+	case 32:
+		cs.constants->mode = AES_GCM_256;
+		break;
+	default:
+		ret = -1;
+		goto err;
+	}
+	cs.constants->tag_byte_length = session->p.auth_digest_len;
+
+	/* Set AES-GCM constants and associated precomputation */
+	if (armv8_aes_gcm_set_constants(cs.constants->mode,
+					cs.constants->tag_byte_length,
+					session->cipher.key_data, &cc) != 0) {
+		ODP_DBG("ARM Crypto: Failure in setting constants\n");
+		ret = -1;
+		goto err;
+	}
+
+	/* Set the reference counter */
+	if (armv8_aes_gcm_set_counter(global->nonce, nonce_length, &cs) != 0) {
+		ODP_DBG("ARM Crypto: Failure while setting nonce\n");
+		ret = -1;
+		goto err;
+	}
+
+	cs.current_tag.d[0] = 0;
+	cs.current_tag.d[1] = 0;
+
+	if (armv8_enc_aes_gcm_from_state(&cs,
+					 global->aad, aad_length,
+					 global->input, plaintext_length,
+					 global->output,
+					 global->digest) != 0) {
+		ODP_DBG("ARM Crypto: AES GCM Encoding failed\n");
+		ret = -1;
+		goto err;
+	}
+
+	odp_packet_copy_from_mem(pkt, offset, param->cipher_range.length,
+				 global->output);
+	odp_packet_copy_from_mem(pkt, param->hash_result_offset,
+				 session->p.auth_digest_len, global->digest);
+
+err:
+	return ret < 0 ? ODP_CRYPTO_ALG_ERR_DATA_SIZE :
+			 ODP_CRYPTO_ALG_ERR_NONE;
+}
+
+static
+odp_crypto_alg_err_t aes_gcm_decrypt(odp_packet_t pkt,
+				     const odp_crypto_packet_op_param_t *param,
+				     odp_crypto_generic_session_t *session)
+{
+	armv8_cipher_state_t cs = {
+		.counter = {
+			.d = {0, 0}
+		}
+	};
+	armv8_cipher_constants_t cc = {
+		.mode = 0
+	};
+	uint8_t *iv_ptr;
+	uint8_t tag[16];
+	uint64_t nonce_length, nonce_byte_length;
+	uint64_t plaintext_length, plaintext_byte_length;
+	uint64_t aad_length, aad_byte_length;
+	int ret = 0;
+
+	/* Clear the allocated buffers */
+	memset(global->input, 0, _ARM_CRYPTO_MAX_DATA_LENGTH);
+	memset(global->nonce, 0, _ARM_CRYPTO_MAX_IV_LENGTH);
+	memset(global->aad, 0, _ARM_CRYPTO_MAX_AAD_LENGTH);
+	memset(global->digest, 0, _ARM_CRYPTO_MAX_DIGEST_LENGTH);
+	memset(global->output, 0, (_ARM_CRYPTO_MAX_DATA_LENGTH +
+	       _ARM_CRYPTO_MAX_DIGEST_LENGTH));
+
+	nonce_length = (session->p.cipher_iv.length) * 8;
+	/* IV length must be a multiple of 16 */
+	nonce_byte_length = ((nonce_length + 127) & ~127UL) >> 3;
+
+	if (param->cipher_iv_ptr)
+		iv_ptr = param->cipher_iv_ptr;
+	else if (session->p.cipher_iv.data)
+		iv_ptr = session->cipher.iv_data;
+	else
+		return ODP_CRYPTO_ALG_ERR_IV_INVALID;
+
+	/* Copy nonce and pad it to nonce_byte_length */
+	for (uint64_t i = 0; i < session->p.cipher_iv.length; i++)
+		global->nonce[i] = iv_ptr[i];
+	for (uint64_t i = session->p.cipher_iv.length; i < nonce_byte_length; i++)
+		global->nonce[i] = 0xde;
+
+	plaintext_length = (param->cipher_range.length) * 8;
+	/* Plaintext length must be a multiple of 16 */
+	plaintext_byte_length = ((plaintext_length + 127) & ~127UL) >> 3;
+
+	/* Copy ciphertext and pad it to plaintext_byte_length */
+	uint32_t offset = param->cipher_range.offset;
+	uint32_t seg_len = 0;
+	uint8_t *data = odp_packet_offset(pkt, offset, &seg_len, NULL);
+
+	for (uint64_t i = 0; i < param->cipher_range.length; i++)
+		global->input[i] = data[i];
+	for (uint64_t i = param->cipher_range.length; i < plaintext_byte_length; i++)
+		global->input[i] = 0xde;
+
+	aad_length = (session->p.auth_aad_len) * 8;
+	/* Pad AAD length to multiple of 16 */
+	aad_byte_length = ((aad_length + 127) & ~127UL) >> 3;
+
+	/* Copy AAD and pad it to aad_byte_length */
+	for (uint64_t i = 0; i < session->p.auth_aad_len; i++)
+		global->aad[i] = param->aad_ptr[i];
+	for (uint64_t i = session->p.auth_aad_len; i < aad_byte_length; i++)
+		global->aad[i] = 0xde;
+
+	cs.constants = &cc;
+	switch (session->p.cipher_key.length) {
+	case 16:
+		cs.constants->mode = AES_GCM_128;
+		break;
+	case 24:
+		cs.constants->mode = AES_GCM_192;
+		break;
+	case 32:
+		cs.constants->mode = AES_GCM_256;
+		break;
+	default:
+		ret = -1;
+		goto err;
+	}
+	cs.constants->tag_byte_length = session->p.auth_digest_len;
+
+	/* Set AES-GCM constants and associated precomputation */
+	if (armv8_aes_gcm_set_constants(cs.constants->mode,
+					cs.constants->tag_byte_length,
+					session->cipher.key_data, &cc) != 0) {
+		ODP_DBG("ARM Crypto: Failure in setting constants\n");
+		ret = -1;
+		goto err;
+	}
+
+	/* Set the reference counter */
+	if (armv8_aes_gcm_set_counter(global->nonce, nonce_length, &cs) != 0) {
+		ODP_DBG("ARM Crypto: Failure while setting nonce\n");
+		ret = -1;
+		goto err;
+	}
+
+	cs.current_tag.d[0] = 0;
+	cs.current_tag.d[1] = 0;
+	/* Copy tag */
+	odp_packet_copy_to_mem(pkt, param->hash_result_offset,
+			       session->p.auth_digest_len, tag);
+
+	if (armv8_dec_aes_gcm_from_state(&cs,
+					 global->aad, aad_length,
+					 global->input, plaintext_length,
+					 tag,
+					 global->output) != 0) {
+		ODP_DBG("ARM Crypto: AES GCM Decoding failed\n");
+		ret = -1;
+		goto err;
+	}
+
+	odp_packet_copy_from_mem(pkt, offset, param->cipher_range.length,
+				 global->output);
+
+err:
+	return ret < 0 ? ODP_CRYPTO_ALG_ERR_ICV_CHECK :
+			 ODP_CRYPTO_ALG_ERR_NONE;
+}
+
+static int process_aes_gcm_param(odp_crypto_generic_session_t *session)
+{
+	/* Verify Key len is valid */
+	if (16 != session->p.cipher_key.length &&
+	    24 != session->p.cipher_key.length &&
+	    32 != session->p.cipher_key.length)
+		return -1;
+
+	/* Verify IV len is correct */
+	if (12 != session->p.cipher_iv.length)
+		return -1;
+
+	memcpy(session->cipher.key_data, session->p.cipher_key.data,
+	       session->p.cipher_key.length);
+
+	/* Set function */
+	if (ODP_CRYPTO_OP_ENCODE == session->p.op)
+		session->cipher.func = aes_gcm_encrypt;
+	else
+		session->cipher.func = aes_gcm_decrypt;
+
+	return 0;
+}
+
 int odp_crypto_capability(odp_crypto_capability_t *capa)
 {
 	if (NULL == capa)
@@ -151,8 +442,15 @@ int odp_crypto_capability(odp_crypto_capability_t *capa)
 	capa->queue_type_sched = 1;
 
 	capa->ciphers.bit.null       = 1;
+	capa->ciphers.bit.aes_gcm    = 1;
 
 	capa->auths.bit.null         = 1;
+	capa->auths.bit.aes_gcm      = 1;
+
+#if ODP_DEPRECATED_API
+	capa->ciphers.bit.aes128_gcm = 1;
+	capa->auths.bit.aes128_gcm   = 1;
+#endif
 
 	capa->max_sessions = MAX_SESSIONS;
 
@@ -171,6 +469,10 @@ int odp_crypto_cipher_capability(odp_cipher_alg_t cipher,
 	case ODP_CIPHER_ALG_NULL:
 		src = cipher_capa_null;
 		num = sizeof(cipher_capa_null) / size;
+		break;
+	case ODP_CIPHER_ALG_AES_GCM:
+		src = cipher_capa_aes_gcm;
+		num = sizeof(cipher_capa_aes_gcm) / size;
 		break;
 	default:
 		return -1;
@@ -196,6 +498,10 @@ int odp_crypto_auth_capability(odp_auth_alg_t auth,
 		src = auth_capa_null;
 		num = sizeof(auth_capa_null) / size;
 		break;
+	case ODP_AUTH_ALG_AES_GCM:
+		src = auth_capa_aes_gcm;
+		num = sizeof(auth_capa_aes_gcm) / size;
+		break;
 	default:
 		return -1;
 	}
@@ -215,6 +521,7 @@ odp_crypto_session_create(const odp_crypto_session_param_t *param,
 {
 	int rc = 0;
 	odp_crypto_generic_session_t *session;
+	int aes_gcm = 0;
 
 	if (odp_global_ro.disable.crypto) {
 		ODP_ERR("Crypto is disabled\n");
@@ -262,6 +569,30 @@ odp_crypto_session_create(const odp_crypto_session_param_t *param,
 		session->cipher.func = null_crypto_routine;
 		rc = 0;
 		break;
+#if ODP_DEPRECATED_API
+	case ODP_CIPHER_ALG_AES128_GCM:
+		/* AES-GCM requires to do both auth and
+		 * cipher at the same time */
+		if (param->auth_alg != ODP_AUTH_ALG_AES128_GCM)
+			rc = -1;
+		else if (param->cipher_key.length == 16)
+			rc = process_aes_gcm_param(session);
+		else
+			rc = -1;
+		break;
+#endif
+	case ODP_CIPHER_ALG_AES_GCM:
+		/* AES-GCM requires to do both auth and
+		 * cipher at the same time */
+		if (param->auth_alg != ODP_AUTH_ALG_AES_GCM)
+			rc = -1;
+		else if (param->cipher_key.length == 16 ||
+			 param->cipher_key.length == 24 ||
+			 param->cipher_key.length == 32)
+			rc = process_aes_gcm_param(session);
+		else
+			rc = -1;
+		break;
 	default:
 		rc = -1;
 	}
@@ -272,11 +603,31 @@ odp_crypto_session_create(const odp_crypto_session_param_t *param,
 		goto err;
 	}
 
+	aes_gcm = 0;
+
 	/* Process based on auth */
 	switch (param->auth_alg) {
 	case ODP_AUTH_ALG_NULL:
 		session->auth.func = null_crypto_routine;
 		rc = 0;
+		break;
+#if ODP_DEPRECATED_API
+	case ODP_AUTH_ALG_AES128_GCM:
+		if (param->cipher_alg == ODP_CIPHER_ALG_AES128_GCM)
+			aes_gcm = 1;
+		/* Fixed digest tag length with deprecated algo */
+		session->p.auth_digest_len = 16;
+#endif
+		/* Fallthrough */
+	case ODP_AUTH_ALG_AES_GCM:
+		/* AES-GCM requires to do both auth and
+		 * cipher at the same time */
+		if (param->cipher_alg == ODP_CIPHER_ALG_AES_GCM || aes_gcm) {
+			session->auth.func = null_crypto_routine;
+			rc = 0;
+		} else {
+			rc = -1;
+		}
 		break;
 	default:
 		rc = -1;
